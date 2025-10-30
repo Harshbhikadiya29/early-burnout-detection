@@ -1,4 +1,7 @@
+# app/app.py
 from flask import Flask, render_template_string, request
+import os
+from project.predict import predict as predict_fn
 
 app = Flask(__name__)
 
@@ -7,22 +10,24 @@ HTML = """
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Early Burnout Check</title>
+  <title>Early Burnout Prediction</title>
   <style>
-    body{font-family:Arial, sans-serif; max-width:800px; margin:40px auto; line-height:1.4}
-    .card{border:1px solid #ddd; border-radius:12px; padding:20px; box-shadow:0 1px 6px rgba(0,0,0,.06)}
-    label{font-weight:600}
+    body{font-family:Arial, sans-serif; max-width:820px; margin:36px auto}
+    .card{border:1px solid #e5e7eb; border-radius:14px; padding:20px; box-shadow:0 1px 6px rgba(0,0,0,.06)}
     .row{margin-bottom:14px}
+    label{font-weight:600}
+    textarea{width:100%; height:110px}
     input[type=range]{width:100%}
+    button{background:#111;color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer}
     .score{font-size:22px; font-weight:700}
     .low{color:#2e7d32}.med{color:#f9a825}.high{color:#c62828}
-    textarea{width:100%; height:110px}
-    button{background:#111;color:#fff;border:none;padding:10px 16px;border-radius:8px;cursor:pointer}
+    small{color:#6b7280}
   </style>
 </head>
 <body>
-  <h1>Early Burnout Detection (Demo)</h1>
-  <p>Enter a short description of how you feel and adjust the sliders. The app returns a simple risk score (0–100) and a label.</p>
+  <h1>Early Burnout Prediction</h1>
+  <p><small>Model path: <code>{{ model_path }}</code>. If unavailable, a safe fallback rules engine is used.</small></p>
+
   <div class="card">
     <form method="post" action="/">
       <div class="row">
@@ -50,77 +55,50 @@ HTML = """
         <input type="range" min="1" max="10" value="{{ stress or 5 }}" name="stress" oninput="t.value=this.value"><output id="t">{{ stress or 5 }}</output>
       </div>
 
-      <button type="submit">Check Risk</button>
+      <button type="submit">Predict</button>
     </form>
   </div>
 
-  {% if score is not none %}
+  {% if result %}
   <div class="card" style="margin-top:18px">
-    <div class="score {{ label_class }}">Risk Score: {{ score }} / 100 — {{ label }}</div>
-    <p><strong>Explanation:</strong> {{ explanation }}</p>
+    {% set css = 'low' if result.label=='Low' else ('med' if result.label=='Moderate' else 'high') %}
+    <div class="score {{ css }}">Risk Score: {{ result.score }} / 100 — {{ result.label }}</div>
+    <p>
+      {% if result.proba is not none %}
+        Model probability: {{ '%.2f'|format(result.proba) }}
+      {% else %}
+        <em>No probability (fallback or model without predict_proba).</em>
+      {% endif %}
+      {% if result.used_fallback %}
+        <br><small>Fallback rules used (trained model missing or incompatible).</small>
+      {% endif %}
+    </p>
   </div>
   {% endif %}
 </body>
 </html>
 """
 
-NEG_KEYS = {
-    "exhausted": 10, "tired": 8, "overwhelmed": 12, "anxious": 8, "stressed": 10,
-    "burnout": 15, "deadline": 6, "pressure": 7, "sleep": 6, "insomnia": 10,
-    "depressed": 14, "fatigue": 10, "cynical": 8, "drained": 10
-}
-POS_KEYS = {"supported": -8, "energized": -8, "motivated": -6, "rested": -8, "balanced": -10}
-
-def rule_score(text, hours, workload, sleep, stress):
-    text = (text or "").lower()
-    base = 0
-    matched = []
-
-    for k, v in NEG_KEYS.items():
-        if k in text:
-            base += v; matched.append(k)
-    for k, v in POS_KEYS.items():
-        if k in text:
-            base += v; matched.append(k)
-
-    base += max(0, (hours - 45)) * 0.9
-    base += (workload - 5) * 2.5
-    base += (stress - 5) * 3.0
-    base += max(0, (6 - sleep)) * 3.0
-
-    score = int(max(0, min(100, round(base))))
-    return score, matched
-
-def label_from_score(s):
-    if s < 35: return "Low", "low"
-    if s < 70: return "Moderate", "med"
-    return "High", "high"
-
 @app.route("/", methods=["GET","POST"])
 def home():
-    ctx = {"score": None}
+    ctx = {
+        "result": None,
+        "free_text": "",
+        "hours": 45, "workload": 6, "sleep": 6, "stress": 5,
+        "model_path": os.getenv("MODEL_PATH", "model/burnout_model.pkl"),
+    }
     if request.method == "POST":
-        free_text = request.form.get("free_text", "")
-        hours = int(request.form.get("hours", 45))
-        workload = int(request.form.get("workload", 6))
-        sleep = int(request.form.get("sleep", 6))
-        stress = int(request.form.get("stress", 5))
-
-        score, matched = rule_score(free_text, hours, workload, sleep, stress)
-        label, css = label_from_score(score)
-
-        why = []
-        if matched: why.append(f"Text signals detected: {', '.join(matched)}.")
-        if hours > 50: why.append("Extended weekly hours.")
-        if workload >= 7: why.append("High perceived workload.")
-        if stress >= 7: why.append("High stress.")
-        if sleep <= 4: why.append("Poor sleep quality.")
-        if not why: why.append("Inputs within typical ranges.")
-
-        ctx.update(dict(
-            score=score, label=label, label_class=css, explanation=" ".join(why),
-            free_text=free_text, hours=hours, workload=workload, sleep=sleep, stress=stress
-        ))
+        payload = {
+            "free_text": request.form.get("free_text", ""),
+            "hours": request.form.get("hours", 45),
+            "workload": request.form.get("workload", 6),
+            "sleep": request.form.get("sleep", 6),
+            "stress": request.form.get("stress", 5),
+        }
+        res = predict_fn(payload)
+        class R: pass
+        r = R(); r.score=res["score"]; r.label=res["label"]; r.proba=res["proba"]; r.used_fallback=res["used_fallback"]
+        ctx.update(payload); ctx["result"] = r
     return render_template_string(HTML, **ctx)
 
 if __name__ == "__main__":
